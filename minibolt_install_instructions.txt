@@ -1,0 +1,54 @@
+Installation for MiniBolt on Ubuntu 22.04:
+
+1. First, ensure you have the required files:
+   - channel_isolator.py
+   - channel_isolator_cli.py
+   - install.sh
+   - generate_proto.sh
+   - minibolt_config.sh
+   - requirements.txt
+
+2. Run the standard installation:
+   cd ~
+   chmod +x install.sh
+   ./install.sh
+
+3. Run the MiniBolt configuration:
+   cd ~/channel_isolator
+   chmod +x minibolt_config.sh
+   ./minibolt_config.sh
+
+4. Install as a system service:
+   sudo cp ~/channel_isolator/channel-isolator-minibolt.service /etc/systemd/system/channel-isolator.service
+   sudo systemctl daemon-reload
+   sudo systemctl enable channel-isolator
+   sudo systemctl start channel-isolator
+
+5. Check it's running:
+   sudo systemctl status channel-isolator
+   sudo journalctl -u channel-isolator -f
+
+6. Test the CLI:
+   ~/channel_isolator/channel-isolator-cli stats
+
+Troubleshooting:
+
+If you get permission errors:
+   sudo usermod -a -G lnd admin
+   # Log out and back in
+
+If the service won't start:
+   # Check LND is running
+   sudo systemctl status lnd
+   
+   # Check permissions on LND files
+   ls -la /data/lnd/tls.cert
+   ls -la /data/lnd/data/chain/bitcoin/mainnet/admin.macaroon
+
+For easier access, add to PATH:
+   echo 'export PATH="$PATH:$HOME/channel_isolator"' >> ~/.bashrc
+   source ~/.bashrc
+
+Then you can use:
+   channel-isolator-cli list
+   channel-isolator-cli stats
