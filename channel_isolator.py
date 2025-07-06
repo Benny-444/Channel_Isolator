@@ -13,6 +13,7 @@ import signal
 import codecs
 import argparse
 import time
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Set, Optional, Dict
@@ -387,7 +388,7 @@ class ChannelIsolator:
 
         def response_generator():
             """Generator that yields responses from the queue"""
-            while not self.shutdown_event.is_set():
+            while True:
                 try:
                     response = response_queue.get(timeout=1)
                     if response is None:  # Shutdown signal
@@ -511,6 +512,13 @@ class ChannelIsolator:
         self.logger.info("Shutting down Channel Isolator...")
         self.running = False
         self.shutdown_event.set()
+
+        # Wait up to 30 seconds for threads to finish gracefully
+        self.logger.info("Waiting for threads to complete...")
+        for i in range(30):
+            if not any(t.is_alive() for t in threading.enumerate() if t != threading.main_thread()):
+                break
+            time.sleep(1)
 
         if self.db_conn:
             self.db_conn.close()

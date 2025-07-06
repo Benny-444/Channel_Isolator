@@ -220,6 +220,9 @@ sudo usermod -a -G lnd $USER
 - The tool requires admin macaroon access to intercept HTLCs
 - The service automatically reconnects if the connection to LND is lost
 
+## Limitations
+- Only one HTLC interceptor can run at a time in LND (v0.19.1 at the time of writing this document). If you're using CircuitBreaker or another interceptor, you cannot run Channel Isolator simultaneously
+
 ## Troubleshooting
 
 1. **Connection Issues**: 
