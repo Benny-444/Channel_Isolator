@@ -54,6 +54,7 @@ class ChannelIsolator:
         self.db_conn = None
         self.stub = None
         self.router_stub = None
+        self.grpc_channel = None
         self.active_sessions: Dict[str, int] = {}  # channel_id -> session_id
         self.exception_lists: Dict[str, Set[str]] = {}  # channel_id -> set of allowed channels
         self.running = False
@@ -184,6 +185,19 @@ class ChannelIsolator:
     def connect_to_lnd(self):
         """Establish gRPC connection to LND"""
         try:
+            # Close any prior channel before creating a new one. If we don't,
+            # LND keeps the old HTLC interceptor subscription bound to the old
+            # stream, and registering a new one fails with "interceptor already
+            # exists".
+            if self.grpc_channel is not None:
+                try:
+                    self.grpc_channel.close()
+                except Exception as close_err:
+                    self.logger.warning(f"Error closing previous gRPC channel: {close_err}")
+                self.grpc_channel = None
+                self.stub = None
+                self.router_stub = None
+
             # Load credentials
             self.logger.info("Reading LND credentials...")
             with open(self.tls_cert_path, 'rb') as f:
@@ -204,6 +218,7 @@ class ChannelIsolator:
 
             self.logger.info("Attempting to connect to LND...")
             channel = grpc.secure_channel('localhost:10009', combined_creds)
+            self.grpc_channel = channel
 
             # Create stubs
             self.stub = lnrpc.LightningStub(channel)
@@ -378,13 +393,20 @@ class ChannelIsolator:
         self.db_conn.commit()
 
     def intercept_htlcs(self):
-        """Main HTLC interception loop using bidirectional streaming with queue"""
+        """Main HTLC interception loop using bidirectional streaming with queue.
+
+        Raises any gRPC error encountered on the stream so the caller can
+        rebuild the connection. Returns normally only on a clean shutdown.
+        """
         if not self.router_stub:
             self.logger.error("Not connected to LND")
-            return
+            raise RuntimeError("Not connected to LND")
 
         self.logger.info("Starting HTLC interception...")
         response_queue = Queue()
+        # Holder for any error raised inside the worker thread so we can
+        # re-raise it from the main thread after join().
+        thread_error = {}
 
         def response_generator():
             """Generator that yields responses from the queue"""
@@ -455,12 +477,15 @@ class ChannelIsolator:
                     response_queue.put(response)
 
             except grpc.RpcError as e:
+                # Don't treat clean cancellation as an error worth restarting for.
                 if e.code() != grpc.StatusCode.CANCELLED:
                     self.logger.error(f"gRPC error in HTLC interceptor: {e}")
+                    thread_error['exc'] = e
             except Exception as e:
                 self.logger.error(f"Error processing HTLC: {e}")
+                thread_error['exc'] = e
             finally:
-                # Signal shutdown
+                # Signal the response generator to exit
                 response_queue.put(None)
 
         # Start processing thread
@@ -478,6 +503,19 @@ class ChannelIsolator:
             response_queue.put(None)
             thread.join(timeout=5)
 
+        # Cancel the stream so LND releases its server-side state. Without
+        # this, LND may still consider the interceptor registered and reject
+        # the next subscription with "interceptor already exists".
+        try:
+            htlc_stream.cancel()
+        except Exception:
+            pass
+
+        # If the worker thread captured an error, surface it so run() can
+        # tear down and rebuild the gRPC channel.
+        if 'exc' in thread_error:
+            raise thread_error['exc']
+
     def run(self):
         """Main run loop"""
         self.logger.info("Starting Channel Isolator...")
@@ -494,18 +532,52 @@ class ChannelIsolator:
 
         self.logger.info("Channel Isolator is running. Press Ctrl+C to stop.")
 
-        # Run the interceptor with reconnection logic
+        # Run the interceptor with reconnection logic.
+        #
+        # Two failure modes we have to handle:
+        #   1. intercept_htlcs() raises (gRPC stream died) — rebuild channel.
+        #   2. intercept_htlcs() returns without shutdown_event being set —
+        #      e.g. LND closed the stream cleanly. Treat that as failure too,
+        #      otherwise we'd reuse the stale gRPC channel and LND would
+        #      reject the next HtlcInterceptor with "interceptor already
+        #      exists".
+        #
+        # Either way we always sleep before retrying so a persistent failure
+        # can't pin the CPU.
+        backoff = 5
+        max_backoff = 60
+
         while self.running and not self.shutdown_event.is_set():
+            stream_failed = False
             try:
                 self.intercept_htlcs()
+                # If we got here without the shutdown flag set, the stream
+                # ended on its own. That's a failure for our purposes.
+                if not self.shutdown_event.is_set():
+                    self.logger.warning(
+                        "HTLC interceptor stream ended unexpectedly without error."
+                    )
+                    stream_failed = True
             except Exception as e:
-                if self.running and not self.shutdown_event.is_set():
-                    self.logger.error(f"Interceptor error: {e}. Reconnecting in 5 seconds...")
-                    time.sleep(5)
-                    # Try to reconnect
-                    if not self.connect_to_lnd():
-                        self.logger.error("Reconnection failed. Retrying in 30 seconds...")
-                        time.sleep(30)
+                if self.shutdown_event.is_set():
+                    break
+                self.logger.error(f"Interceptor error: {e}")
+                stream_failed = True
+
+            if not stream_failed or self.shutdown_event.is_set():
+                continue
+
+            # Tear down the existing channel and reconnect from scratch.
+            self.logger.info(f"Reconnecting in {backoff} seconds...")
+            if self.shutdown_event.wait(timeout=backoff):
+                break
+
+            if self.connect_to_lnd():
+                # Successful reconnect — reset backoff for next failure.
+                backoff = 5
+            else:
+                self.logger.error("Reconnection failed.")
+                backoff = min(backoff * 2, max_backoff)
 
     def shutdown(self, signum=None, frame=None):
         """Graceful shutdown"""
@@ -519,6 +591,12 @@ class ChannelIsolator:
             if not any(t.is_alive() for t in threading.enumerate() if t != threading.main_thread()):
                 break
             time.sleep(1)
+
+        if self.grpc_channel:
+            try:
+                self.grpc_channel.close()
+            except Exception:
+                pass
 
         if self.db_conn:
             self.db_conn.close()
