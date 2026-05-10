@@ -101,10 +101,10 @@ PartOf=lnd.service
 
 [Service]
 Type=simple
-ExecStartPre=/bin/sleep 10
 ExecStart=$INSTALL_DIR/channel-isolator
 Restart=always
-RestartSec=30
+RestartSec=3
+StartLimitIntervalSec=0
 User=$USER
 StandardOutput=journal
 StandardError=journal
