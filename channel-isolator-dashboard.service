@@ -1,0 +1,20 @@
+[Unit]
+Description=Channel Isolator Web Dashboard
+After=network.target
+
+[Service]
+Type=simple
+User=admin
+Group=admin
+WorkingDirectory=/home/admin/channel_isolator
+Environment=PATH=/home/admin/channel_isolator/venv/bin:/usr/local/bin:/usr/bin:/bin
+Environment=CHANNEL_ISOLATOR_DASHBOARD_PASSWORD=YourStrongPasswordHere123!
+Environment=DASH_PORT=8081
+ExecStart=/home/admin/channel_isolator/venv/bin/python /home/admin/channel_isolator/dashboard.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
