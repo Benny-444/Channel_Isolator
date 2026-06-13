@@ -213,6 +213,7 @@ def dashboard():
             recent_attempts=[],
             history=[],
             all_channels=[],
+            isolate_channels=[],
             attempts_limit=15,
             has_more_attempts=False,
             to_iso_utc=to_iso_utc,
@@ -238,6 +239,12 @@ def dashboard():
         iso['alias_label'] = (
             iso.get('channel_alias') or aliases.get(str(iso['channel_id']), '')
         )
+
+    # Channels available to isolate = all channels minus those already isolated
+    # (you can't isolate a channel that's already isolated). Source for the
+    # Isolate-New-Channel dropdown.
+    isolated_ids = {str(iso['channel_id']) for iso in active_isolations}
+    isolate_channels = [ch for ch in all_channels if ch['scid'] not in isolated_ids]
 
     # All exceptions (joined with channel info)
     exceptions = execute_query("""
@@ -320,6 +327,7 @@ def dashboard():
         recent_attempts=recent_attempts,
         history=history,
         all_channels=all_channels,
+        isolate_channels=isolate_channels,
         attempts_limit=attempts_limit,
         has_more_attempts=has_more_attempts,
         to_iso_utc=to_iso_utc,
@@ -335,6 +343,10 @@ def isolate_channel():
     if not channel_id:
         flash("Channel ID is required.", "error")
         return redirect(url_for('dashboard'))
+
+    # No custom alias given? Default to the channel's peer alias from lncli.
+    if not alias:
+        alias = get_channel_aliases().get(channel_id) or None
 
     # Check if already active
     existing = execute_query(
@@ -720,9 +732,19 @@ DASHBOARD_HTML = """
                 </h2>
                 <form method="POST" action="{{ url_for('isolate_channel') }}" class="space-y-4">
                     <div>
-                        <label class="block text-xs font-medium text-zinc-400 mb-1.5">CHANNEL ID</label>
-                        <input type="text" name="channel_id" required placeholder="e.g. 1234567890123456789"
-                               class="w-full bg-zinc-950 border border-zinc-800 focus:border-emerald-600 rounded-2xl px-4 py-2.5 text-sm font-mono placeholder:text-zinc-600 outline-none">
+                        <label class="block text-xs font-medium text-zinc-400 mb-1.5">CHANNEL</label>
+                        <div class="relative">
+                            <select name="channel_id" required
+                                    class="w-full appearance-none bg-zinc-950 border border-zinc-800 focus:border-emerald-600 rounded-2xl px-4 py-2.5 pr-10 text-sm font-mono text-zinc-200 outline-none cursor-pointer">
+                                <option value="" disabled selected>
+                                    {% if isolate_channels %}Select a channel to isolate…{% else %}No channels available{% endif %}
+                                </option>
+                                {% for ch in isolate_channels %}
+                                <option value="{{ ch.scid }}">{{ ch.scid }}{% if ch.alias %} ({{ ch.alias }}){% endif %}</option>
+                                {% endfor %}
+                            </select>
+                            <i class="fa-solid fa-chevron-down pointer-events-none absolute right-4 top-1/2 -translate-y-1/2 text-zinc-600 text-xs"></i>
+                        </div>
                     </div>
                     <div>
                         <label class="block text-xs font-medium text-zinc-400 mb-1.5">ALIAS (OPTIONAL)</label>
