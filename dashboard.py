@@ -12,7 +12,10 @@ Access at http://localhost:8081 (or your node's IP:port after firewall allow)
 import os
 import sqlite3
 import time
-from datetime import datetime
+import json
+import subprocess
+import threading
+from datetime import datetime, timezone
 from flask import (
     Flask, render_template_string, request, redirect, url_for,
     session, flash, jsonify
@@ -24,10 +27,84 @@ DB_PATH = os.path.expanduser("~/channel_isolator/channel_isolator.db")
 DASH_PASSWORD = os.environ.get("CHANNEL_ISOLATOR_DASHBOARD_PASSWORD", "changeme123")
 PORT = int(os.environ.get("DASH_PORT", 8081))
 HOST = "0.0.0.0"  # Change to 127.0.0.1 for localhost-only
+ALIAS_CACHE_TTL = 300  # 5 minutes
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
 app.config['TEMPLATES_AUTO_RELOAD'] = True
+
+# ============== CHANNEL DATA (via lncli) ==============
+# A single cached `lncli listchannels` call feeds two things:
+#   1. aliases:  SCID -> peer_alias  (used to resolve aliases for display)
+#   2. channels: [{scid, alias}, ...] (used to populate the Add-Exception dropdowns)
+# Caching both off one subprocess call avoids hitting lncli twice per page load.
+_channel_cache = {'aliases': {}, 'channels': [], 'expires': 0}
+_channel_cache_lock = threading.Lock()
+
+def _refresh_channel_cache():
+    """Run `lncli listchannels` once and populate the alias map + channel list.
+
+    The htlc_attempts / exception_list tables store channels as decimal SCIDs.
+    Newer LND returns that value in the 'scid' field ('chan_id' becomes the
+    32-byte hex BOLT2 channel id); older LND puts the decimal SCID directly in
+    'chan_id'. We accept any decimal-looking id so both layouts work.
+
+    Fails gracefully: on any error we leave whatever is already cached in
+    place, so the dashboard keeps working (dropdowns/aliases just may be empty
+    or slightly stale) and never crashes because lncli hiccuped.
+    """
+    aliases = {}
+    channels = []
+    try:
+        result = subprocess.run(
+            ['lncli', 'listchannels'],
+            capture_output=True, text=True, timeout=10, check=True
+        )
+        data = json.loads(result.stdout)
+        for ch in data.get('channels', []):
+            alias = (ch.get('peer_alias') or '').strip()
+            scid = None
+            # Newer LND: decimal SCID lives in 'scid'. Older LND: in 'chan_id'.
+            for key in ('scid', 'chan_id'):
+                cid = ch.get(key)
+                if cid and str(cid).isdigit():
+                    aliases[str(cid)] = alias
+                    if scid is None:
+                        scid = str(cid)
+            if scid:
+                channels.append({'scid': scid, 'alias': alias})
+        # Sort for the dropdown: named channels first (alphabetical), then
+        # any unnamed ones by SCID. Makes the list easy to scan.
+        channels.sort(key=lambda c: (c['alias'] == '', c['alias'].lower(), c['scid']))
+        with _channel_cache_lock:
+            _channel_cache['aliases'] = aliases
+            _channel_cache['channels'] = channels
+            _channel_cache['expires'] = time.time() + ALIAS_CACHE_TTL
+    except Exception:
+        # Leave the existing cache untouched.
+        pass
+
+def _ensure_channel_cache():
+    """Refresh the cache if it has expired or is empty."""
+    now = time.time()
+    with _channel_cache_lock:
+        fresh = now < _channel_cache['expires'] and (
+            _channel_cache['aliases'] or _channel_cache['channels']
+        )
+    if not fresh:
+        _refresh_channel_cache()
+
+def get_channel_aliases():
+    """Return the cached SCID -> peer_alias map (refreshing if stale)."""
+    _ensure_channel_cache()
+    with _channel_cache_lock:
+        return dict(_channel_cache['aliases'])
+
+def get_channels_list():
+    """Return the cached [{scid, alias}, ...] list (refreshing if stale)."""
+    _ensure_channel_cache()
+    with _channel_cache_lock:
+        return list(_channel_cache['channels'])
 
 # ============== HELPERS ==============
 def login_required(f):
@@ -83,6 +160,26 @@ def format_timestamp(ts):
     except:
         return ts
 
+def to_iso_utc(ts):
+    """Convert a DB timestamp (UTC) into an ISO-8601 string with a 'Z' suffix.
+
+    SQLite CURRENT_TIMESTAMP stores 'YYYY-MM-DD HH:MM:SS' in UTC with no tz
+    marker. Browsers parse that ambiguously, so we hand the page an explicit
+    '...THH:MM:SSZ' form that every browser reads as UTC; client-side JS then
+    renders it in the viewer's local timezone. Returns '' on missing/bad input
+    so the template's server-rendered fallback (UTC) is left in place.
+    """
+    if not ts:
+        return ""
+    try:
+        dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            # Naive value — UTC by SQLite's definition.
+            return dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+        return dt.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    except Exception:
+        return ts
+
 # ============== ROUTES ==============
 @app.route('/login', methods=['GET', 'POST'])
 def login():
@@ -111,9 +208,20 @@ def dashboard():
         return render_template_string(DASHBOARD_HTML,
             active_isolations=[],
             exceptions=[],
+            exception_groups=[],
             stats={},
             recent_attempts=[],
-            history=[])
+            history=[],
+            all_channels=[],
+            attempts_limit=15,
+            has_more_attempts=False,
+            to_iso_utc=to_iso_utc,
+            format_timestamp=format_timestamp)
+
+    # Live alias map (cached lncli call) — used to resolve aliases for display
+    # and, via get_channels_list(), to populate the Add-Exception dropdowns.
+    aliases = get_channel_aliases()
+    all_channels = get_channels_list()
 
     # Active isolations (with stats)
     active_isolations = execute_query("""
@@ -123,6 +231,13 @@ def dashboard():
         WHERE status = 'active'
         ORDER BY start_timestamp DESC
     """)
+    # Resolve a label alias for each isolated channel: prefer the alias set at
+    # isolation time, fall back to the live lncli alias. Used by the dropdown
+    # and harmless to the rest of the page.
+    for iso in active_isolations:
+        iso['alias_label'] = (
+            iso.get('channel_alias') or aliases.get(str(iso['channel_id']), '')
+        )
 
     # All exceptions (joined with channel info)
     exceptions = execute_query("""
@@ -133,8 +248,17 @@ def dashboard():
         WHERE s.status = 'active'
         ORDER BY s.start_timestamp DESC, e.added_timestamp DESC
     """)
+    # Resolve the alias to ALWAYS display for each exception: prefer the live
+    # lncli alias (fresh, and fixes any stale/odd stored value), then fall back
+    # to whatever was stored in the DB. This also backfills older rows for free.
+    for ex in exceptions:
+        ex['allowed_alias_resolved'] = (
+            aliases.get(str(ex['allowed_channel_id'])) or ex.get('allowed_alias') or ''
+        )
 
-    # Group exceptions by isolated channel for clearer categorized display
+    # Group exceptions by isolated channel for clearer categorized display.
+    # NOTE: the dicts placed here are the *same objects* as in `exceptions`
+    # above, so the resolved-alias key we set is already present here too.
     exception_groups = []
     for iso in active_isolations:
         exs = [e for e in exceptions if e['isolated_channel_id'] == iso['channel_id']]
@@ -153,15 +277,30 @@ def dashboard():
         'total_rejected': execute_query("SELECT SUM(total_rejected) as s FROM isolation_sessions", fetch=True)[0]['s'] or 0,
     }
 
-    # Recent HTLC attempts (last 15)
-    recent_attempts = execute_query("""
+    # Recent HTLC attempts — paginated via ?attempts=N (default 15, +50 per click)
+    attempts_limit = max(15, int(request.args.get('attempts', 15)))
+
+    # Fetch one extra to detect whether more rows exist
+    recent_attempts_raw = execute_query("""
         SELECT h.timestamp, h.source_channel_id, h.source_alias, h.amount_msat,
-               h.decision, h.outcome, s.channel_id as isolated_channel
+               h.decision, h.outcome, s.channel_id as isolated_channel,
+               s.channel_alias as isolated_alias
         FROM htlc_attempts h
         JOIN isolation_sessions s ON h.session_id = s.session_id
         ORDER BY h.timestamp DESC
-        LIMIT 15
-    """)
+        LIMIT ?
+    """, (attempts_limit + 1,))
+
+    has_more_attempts = len(recent_attempts_raw) > attempts_limit
+    recent_attempts = recent_attempts_raw[:attempts_limit]
+
+    # Enrich with live aliases from lncli (covers source + isolated channels)
+    for att in recent_attempts:
+        att['source_alias_resolved'] = aliases.get(str(att['source_channel_id']), '')
+        # Prefer the alias set at isolation time; fall back to live lncli lookup
+        att['isolated_alias_resolved'] = (
+            att.get('isolated_alias') or aliases.get(str(att['isolated_channel']), '')
+        )
 
     # Recent history (last 10 completed)
     history = execute_query("""
@@ -180,6 +319,10 @@ def dashboard():
         stats=stats,
         recent_attempts=recent_attempts,
         history=history,
+        all_channels=all_channels,
+        attempts_limit=attempts_limit,
+        has_more_attempts=has_more_attempts,
+        to_iso_utc=to_iso_utc,
         format_timestamp=format_timestamp
     )
 
@@ -234,10 +377,9 @@ def stop_isolation(channel_id):
 def add_exception():
     isolated_id = request.form.get('isolated_id', '').strip()
     allowed_id = request.form.get('allowed_id', '').strip()
-    allowed_alias = request.form.get('allowed_alias', '').strip() or None
 
     if not isolated_id or not allowed_id:
-        flash("Both isolated channel and allowed channel IDs are required.", "error")
+        flash("Both isolated channel and allowed channel must be selected.", "error")
         return redirect(url_for('dashboard'))
 
     # Find active session for isolated channel
@@ -260,13 +402,21 @@ def add_exception():
         flash("That exception already exists.", "error")
         return redirect(url_for('dashboard'))
 
+    # Resolve the alias from the live channel map and store it as a fallback.
+    # (Display always re-resolves live too, so this is just a sensible default
+    # to keep around for when the channel later closes / drops out of lncli.)
+    allowed_alias = get_channel_aliases().get(allowed_id)
+    # Defensive: honour an explicitly-submitted alias if one is ever posted.
+    allowed_alias = (request.form.get('allowed_alias', '').strip() or allowed_alias) or None
+
     execute_query(
         "INSERT INTO exception_list (session_id, allowed_channel_id, allowed_alias) VALUES (?, ?, ?)",
         (session_id, allowed_id, allowed_alias),
         fetch=False
     )
     update_last_modified()
-    flash(f"✅ Exception added: {allowed_id} can now route to {isolated_id}.", "success")
+    label = f"{allowed_id} ({allowed_alias})" if allowed_alias else allowed_id
+    flash(f"✅ Exception added: {label} can now route to {isolated_id}.", "success")
     return redirect(url_for('dashboard'))
 
 @app.route('/remove_exception/<int:exception_id>')
@@ -367,6 +517,8 @@ DASHBOARD_HTML = """
         .metric:hover { transform: translateY(-2px); }
         .nav-active { background: #18181b; color: #10b981; border-radius: 9999px; }
         .section { scroll-margin-top: 80px; }
+        /* Best-effort dark styling for native select option lists. */
+        select option { background-color: #18181b; color: #e4e4e7; }
     </style>
 </head>
 <body class="bg-zinc-950 text-zinc-200">
@@ -528,7 +680,7 @@ DASHBOARD_HTML = """
                                     <div class="text-emerald-400 text-xs">{{ iso.channel_alias }}</div>
                                     {% endif %}
                                 </td>
-                                <td class="px-6 py-4 text-xs text-zinc-400">{{ format_timestamp(iso.start_timestamp) }}</td>
+                                <td class="px-6 py-4 text-xs text-zinc-400"><span class="ts" data-utc="{{ to_iso_utc(iso.start_timestamp) }}">{{ format_timestamp(iso.start_timestamp) }}</span></td>
                                 <td class="px-6 py-4 text-center">
                                     <span class="font-mono text-sm">{{ iso.total_attempts or 0 }}</span>
                                 </td>
@@ -620,8 +772,10 @@ DASHBOARD_HTML = """
                                     <div class="flex items-center gap-3 text-sm">
                                         <div>
                                             <span class="font-mono text-xs text-amber-400">{{ ex.allowed_channel_id }}</span>
-                                            {% if ex.allowed_alias %}
-                                            <span class="text-[10px] text-zinc-400 ml-1">({{ ex.allowed_alias }})</span>
+                                            {% if ex.allowed_alias_resolved %}
+                                            <span class="text-[10px] text-zinc-400 ml-1">({{ ex.allowed_alias_resolved }})</span>
+                                            {% else %}
+                                            <span class="text-[10px] text-zinc-600 italic ml-1">(unknown)</span>
                                             {% endif %}
                                         </div>
                                         <div class="text-xs text-zinc-500">can route into this channel</div>
@@ -654,14 +808,34 @@ DASHBOARD_HTML = """
                         </h3>
                         <form method="POST" action="{{ url_for('add_exception') }}" class="grid grid-cols-1 md:grid-cols-12 gap-3">
                             <div class="md:col-span-5">
-                                <label class="block text-[10px] text-zinc-500 mb-1">ISOLATED CHANNEL ID</label>
-                                <input type="text" name="isolated_id" placeholder="e.g. 1234567890123456789" required
-                                       class="w-full bg-zinc-950 border border-zinc-800 focus:border-amber-600 rounded-2xl px-4 py-2 text-sm font-mono placeholder:text-zinc-600 outline-none">
+                                <label class="block text-[10px] text-zinc-500 mb-1">ISOLATED CHANNEL</label>
+                                <div class="relative">
+                                    <select name="isolated_id" required
+                                            class="w-full appearance-none bg-zinc-950 border border-zinc-800 focus:border-amber-600 rounded-2xl px-4 py-2 pr-10 text-sm font-mono text-zinc-200 outline-none cursor-pointer">
+                                        <option value="" disabled selected>
+                                            {% if active_isolations %}Select isolated channel…{% else %}No isolated channels{% endif %}
+                                        </option>
+                                        {% for iso in active_isolations %}
+                                        <option value="{{ iso.channel_id }}">{{ iso.channel_id }}{% if iso.alias_label %} ({{ iso.alias_label }}){% endif %}</option>
+                                        {% endfor %}
+                                    </select>
+                                    <i class="fa-solid fa-chevron-down pointer-events-none absolute right-4 top-1/2 -translate-y-1/2 text-zinc-600 text-xs"></i>
+                                </div>
                             </div>
                             <div class="md:col-span-5">
-                                <label class="block text-[10px] text-zinc-500 mb-1">ALLOWED SOURCE CHANNEL ID</label>
-                                <input type="text" name="allowed_id" placeholder="e.g. 9876543210987654321" required
-                                       class="w-full bg-zinc-950 border border-zinc-800 focus:border-amber-600 rounded-2xl px-4 py-2 text-sm font-mono placeholder:text-zinc-600 outline-none">
+                                <label class="block text-[10px] text-zinc-500 mb-1">ALLOWED SOURCE CHANNEL</label>
+                                <div class="relative">
+                                    <select name="allowed_id" required
+                                            class="w-full appearance-none bg-zinc-950 border border-zinc-800 focus:border-amber-600 rounded-2xl px-4 py-2 pr-10 text-sm font-mono text-zinc-200 outline-none cursor-pointer">
+                                        <option value="" disabled selected>
+                                            {% if all_channels %}Select source channel…{% else %}Channel list unavailable{% endif %}
+                                        </option>
+                                        {% for ch in all_channels %}
+                                        <option value="{{ ch.scid }}">{{ ch.scid }}{% if ch.alias %} ({{ ch.alias }}){% endif %}</option>
+                                        {% endfor %}
+                                    </select>
+                                    <i class="fa-solid fa-chevron-down pointer-events-none absolute right-4 top-1/2 -translate-y-1/2 text-zinc-600 text-xs"></i>
+                                </div>
                             </div>
                             <div class="md:col-span-2 flex items-end">
                                 <button type="submit" class="w-full bg-amber-600 hover:bg-amber-500 active:bg-amber-700 transition-all text-white py-2.5 rounded-2xl text-sm font-medium flex items-center justify-center gap-2">
@@ -675,10 +849,10 @@ DASHBOARD_HTML = """
             </div>
 
             <!-- Recent Attempts -->
-            <div class="xl:col-span-7 glass border border-zinc-800 rounded-3xl overflow-hidden">
+            <div class="xl:col-span-7 glass border border-zinc-800 rounded-3xl overflow-hidden" id="attempts">
                 <div class="px-6 py-4 border-b border-zinc-800 flex items-center justify-between">
                     <h2 class="font-semibold flex items-center gap-2"><i class="fa-solid fa-history text-zinc-400"></i> Recent HTLC Attempts</h2>
-                    <span class="text-xs text-zinc-500">Last 15 • from isolated channels</span>
+                    <span class="text-xs text-zinc-500">Showing {{ recent_attempts|length }} • from isolated channels</span>
                 </div>
 
                 {% if recent_attempts %}
@@ -694,14 +868,24 @@ DASHBOARD_HTML = """
                     <tbody class="divide-y divide-zinc-800 text-xs">
                         {% for att in recent_attempts %}
                         <tr class="hover:bg-zinc-900/50">
-                            <td class="px-6 py-3 text-zinc-400 font-mono">{{ format_timestamp(att.timestamp) }}</td>
+                            <td class="px-6 py-3 text-zinc-400 font-mono align-top"><span class="ts" data-utc="{{ to_iso_utc(att.timestamp) }}">{{ format_timestamp(att.timestamp) }}</span></td>
                             <td class="px-6 py-3 font-mono">
-                                <span class="text-amber-400">{{ att.source_channel_id }}</span>
-                                <span class="text-zinc-600 mx-1">→</span>
-                                <span class="text-emerald-400">{{ att.isolated_channel }}</span>
+                                <div>
+                                    <span class="text-amber-400">{{ att.source_channel_id }}</span>
+                                    {% if att.source_alias_resolved %}
+                                    <span class="text-zinc-500 text-[10px] ml-1">({{ att.source_alias_resolved }})</span>
+                                    {% endif %}
+                                </div>
+                                <div class="text-zinc-600 text-[10px] mt-0.5">↓</div>
+                                <div>
+                                    <span class="text-emerald-400">{{ att.isolated_channel }}</span>
+                                    {% if att.isolated_alias_resolved %}
+                                    <span class="text-zinc-500 text-[10px] ml-1">({{ att.isolated_alias_resolved }})</span>
+                                    {% endif %}
+                                </div>
                             </td>
-                            <td class="px-6 py-3 text-right font-mono">{{ (att.amount_msat / 1000)|int }}</td>
-                            <td class="px-6 py-3 text-center">
+                            <td class="px-6 py-3 text-right font-mono align-top">{{ (att.amount_msat / 1000)|int }}</td>
+                            <td class="px-6 py-3 text-center align-top">
                                 {% if att.decision == 'allowed' %}
                                     <span class="px-2.5 py-px text-[10px] bg-emerald-950 text-emerald-400 rounded">ALLOWED</span>
                                 {% else %}
@@ -712,6 +896,15 @@ DASHBOARD_HTML = """
                         {% endfor %}
                     </tbody>
                 </table>
+                {% if has_more_attempts %}
+                <div class="px-6 py-3 border-t border-zinc-800 text-center bg-zinc-900/30">
+                    <a href="?attempts={{ attempts_limit + 50 }}#attempts"
+                       class="inline-flex items-center gap-2 text-xs text-emerald-400 hover:text-emerald-300 px-3 py-1.5 rounded-xl hover:bg-zinc-900 transition">
+                        <i class="fa-solid fa-chevron-down"></i>
+                        <span>Load 50 more</span>
+                    </a>
+                </div>
+                {% endif %}
                 {% else %}
                 <div class="p-8 text-center text-sm text-zinc-500">No HTLC attempts recorded yet on isolated channels.</div>
                 {% endif %}
@@ -727,7 +920,7 @@ DASHBOARD_HTML = """
                     <div class="flex justify-between items-start border-l-2 border-zinc-700 pl-3">
                         <div>
                             <div class="font-mono text-xs text-zinc-400">{{ h.channel_id }}</div>
-                            <div class="text-xs text-zinc-500">{{ format_timestamp(h.start_timestamp) }} → {{ format_timestamp(h.end_timestamp) }}</div>
+                            <div class="text-xs text-zinc-500"><span class="ts" data-utc="{{ to_iso_utc(h.start_timestamp) }}">{{ format_timestamp(h.start_timestamp) }}</span> → <span class="ts" data-utc="{{ to_iso_utc(h.end_timestamp) }}">{{ format_timestamp(h.end_timestamp) }}</span></div>
                         </div>
                         <div class="text-right text-xs">
                             <div><span class="text-emerald-400">{{ h.total_allowed or 0 }}</span> / <span class="text-red-400">{{ h.total_rejected or 0 }}</span></div>
@@ -759,7 +952,29 @@ DASHBOARD_HTML = """
         function initializeTailwind() {
             document.documentElement.style.setProperty('--accent', '#10b981');
         }
-        window.onload = initializeTailwind;
+
+        // Convert all server-rendered UTC timestamps to the viewer's local time.
+        // Each timestamp is emitted as <span class="ts" data-utc="...Z">UTC fallback</span>.
+        // If JS is disabled or a value won't parse, the UTC fallback simply stays.
+        function fmtLocal(d) {
+            const p = n => String(n).padStart(2, '0');
+            return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate())
+                 + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+        }
+        function localizeTimestamps() {
+            document.querySelectorAll('span.ts[data-utc]').forEach(function (el) {
+                const raw = el.getAttribute('data-utc');
+                if (!raw) return;
+                const d = new Date(raw);
+                if (isNaN(d.getTime())) return;  // leave the UTC fallback
+                el.textContent = fmtLocal(d);
+            });
+        }
+
+        window.onload = function () {
+            initializeTailwind();
+            localizeTimestamps();
+        };
 
         // Optional: auto refresh every 60s (uncomment if desired)
         // setTimeout(() => window.location.reload(), 60000);
