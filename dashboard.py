@@ -404,6 +404,40 @@ def add_exception():
         return redirect(url_for('dashboard'))
 
     session_id = session_row[0]['session_id']
+    aliases = get_channel_aliases()
+
+    # Bulk option: "All channels" — add every channel as an exception at once,
+    # skipping any that already exist and the isolated channel itself.
+    if allowed_id == '__ALL__':
+        channels = get_channels_list()
+        if not channels:
+            flash("Channel list unavailable (lncli) — nothing to add.", "error")
+            return redirect(url_for('dashboard'))
+        existing = execute_query(
+            "SELECT allowed_channel_id FROM exception_list WHERE session_id = ?",
+            (session_id,)
+        )
+        existing_ids = {row['allowed_channel_id'] for row in existing}
+        added = 0
+        for ch in channels:
+            scid = ch['scid']
+            if scid == isolated_id or scid in existing_ids:
+                continue
+            alias = ch.get('alias') or aliases.get(scid) or None
+            execute_query(
+                "INSERT INTO exception_list (session_id, allowed_channel_id, allowed_alias) VALUES (?, ?, ?)",
+                (session_id, scid, alias),
+                fetch=False
+            )
+            existing_ids.add(scid)
+            added += 1
+        if added:
+            update_last_modified()
+            flash(f"✅ Added {added} channel(s) as exceptions to {isolated_id}. "
+                  f"Every current peer can now route into it.", "success")
+        else:
+            flash("Every channel is already an exception — nothing to add.", "error")
+        return redirect(url_for('dashboard'))
 
     # Check duplicate
     dup = execute_query(
@@ -417,7 +451,7 @@ def add_exception():
     # Resolve the alias from the live channel map and store it as a fallback.
     # (Display always re-resolves live too, so this is just a sensible default
     # to keep around for when the channel later closes / drops out of lncli.)
-    allowed_alias = get_channel_aliases().get(allowed_id)
+    allowed_alias = aliases.get(allowed_id)
     # Defensive: honour an explicitly-submitted alias if one is ever posted.
     allowed_alias = (request.form.get('allowed_alias', '').strip() or allowed_alias) or None
 
@@ -852,6 +886,9 @@ DASHBOARD_HTML = """
                                         <option value="" disabled selected>
                                             {% if all_channels %}Select source channel…{% else %}Channel list unavailable{% endif %}
                                         </option>
+                                        {% if all_channels %}
+                                        <option value="__ALL__">✦ All channels ({{ all_channels|length }})</option>
+                                        {% endif %}
                                         {% for ch in all_channels %}
                                         <option value="{{ ch.scid }}">{{ ch.scid }}{% if ch.alias %} ({{ ch.alias }}){% endif %}</option>
                                         {% endfor %}
