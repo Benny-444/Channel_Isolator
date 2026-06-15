@@ -66,6 +66,14 @@ class ChannelIsolator:
         self.sessions_lock = Lock()
         self.last_db_modified = 0
 
+        # Background DB sync (decoupled from HTLC traffic). The main interceptor
+        # loop calls reload_sessions_if_changed() on every ~1s tick; it reads the
+        # DB on a FRESH connection so it always sees committed changes from the
+        # CLI/dashboard, and refreshes the in-memory maps within ~1s even when no
+        # HTLCs are flowing.
+        self.last_sync_time = 0
+        self.sync_interval = 0.5  # seconds between DB syncs
+
         # Setup logging
         self.setup_logging()
 
@@ -181,6 +189,62 @@ class ChannelIsolator:
             self.logger.info("Database modification detected, reloading sessions...")
             self.load_active_sessions()
             self.last_db_modified = db_modified
+
+    def reload_sessions_if_changed(self):
+        """Sync in-memory sessions from the DB using a FRESH connection.
+
+        This runs from the main interceptor loop (not the HTLC worker thread),
+        so it keeps firing even when the node is completely idle. Opening a
+        brand-new connection each time guarantees we see the latest committed
+        state — the long-lived interceptor connection can hold a stale read
+        snapshot, which is how a stopped isolation could keep being enforced
+        for hours. Rate-limited, and only updates (and logs) when the active
+        set actually changed. Never raises: a DB hiccup just skips this round
+        and we try again on the next tick.
+        """
+        now = time.time()
+        if now - self.last_sync_time < self.sync_interval:
+            return
+        self.last_sync_time = now
+
+        try:
+            conn = sqlite3.connect(str(DB_PATH))
+            try:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT session_id, channel_id FROM isolation_sessions WHERE status = 'active'"
+                )
+                rows = cursor.fetchall()
+                new_sessions: Dict[str, int] = {}
+                new_exceptions: Dict[str, Set[str]] = {}
+                for session_id, channel_id in rows:
+                    new_sessions[channel_id] = session_id
+                    cursor.execute(
+                        "SELECT allowed_channel_id FROM exception_list WHERE session_id = ?",
+                        (session_id,)
+                    )
+                    new_exceptions[channel_id] = {r[0] for r in cursor.fetchall()}
+            finally:
+                conn.close()
+        except Exception as e:
+            self.logger.warning(f"Session sync skipped (DB read error): {e}")
+            return
+
+        # Briefly take the lock to compare and swap. The interceptor holds this
+        # same lock while reading the maps, so the swap is atomic w.r.t. reads.
+        with self.sessions_lock:
+            changed = (
+                new_sessions != self.active_sessions
+                or new_exceptions != self.exception_lists
+            )
+            if changed:
+                self.active_sessions = new_sessions
+                self.exception_lists = new_exceptions
+
+        if changed:
+            self.logger.info(
+                f"Reloaded sessions from DB: {len(new_sessions)} active isolation session(s)"
+            )
 
     def connect_to_lnd(self):
         """Establish gRPC connection to LND"""
@@ -494,6 +558,9 @@ class ChannelIsolator:
 
         # Wait for thread to complete or shutdown event
         while not self.shutdown_event.is_set():
+            # Keep the in-memory session map in sync with the DB on every tick,
+            # independent of HTLC traffic and using a fresh connection.
+            self.reload_sessions_if_changed()
             thread.join(timeout=1)
             if not thread.is_alive():
                 break
